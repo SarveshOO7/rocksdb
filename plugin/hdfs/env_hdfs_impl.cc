@@ -4,16 +4,19 @@
 //  (found in the LICENSE.Apache file in the root directory).
 //
 
-#include "env_hdfs.h"
-
 #include <rocksdb/env.h>
-
 #include <stdio.h>
 #include <sys/time.h>
 #include <time.h>
+
 #include <algorithm>
+#include <chrono>
+#include <functional>
 #include <iostream>
 #include <sstream>
+#include <thread>
+
+#include "env_hdfs.h"
 #include "logging/logging.h"
 #include "rocksdb/status.h"
 #include "util/string_util.h"
@@ -31,19 +34,18 @@ namespace ROCKSDB_NAMESPACE {
 namespace {
 // Thrown during execution when there is an issue with the supplied
 // arguments.
-class HdfsUsageException : public std::exception { };
+class HdfsUsageException : public std::exception {};
 
 // A simple exception that indicates something went wrong that is not
 // recoverable.  The intention is for the message to be printed (with
 // nothing else) and the process terminate.
 class HdfsFatalException : public std::exception {
-public:
-  explicit HdfsFatalException(const std::string& s) : what_(s) { }
-  virtual ~HdfsFatalException() throw() { }
-  virtual const char* what() const throw() {
-    return what_.c_str();
-  }
-private:
+ public:
+  explicit HdfsFatalException(const std::string& s) : what_(s) {}
+  virtual ~HdfsFatalException() throw() {}
+  virtual const char* what() const throw() { return what_.c_str(); }
+
+ private:
   const std::string what_;
 };
 
@@ -91,8 +93,36 @@ class HdfsReadableFile : virtual public FSSequentialFile,
     hfile_ = nullptr;
   }
 
-  bool isValid() {
-    return hfile_ != nullptr;
+  bool isValid() { return hfile_ != nullptr; }
+
+  static void doAsyncRead(FSReadRequest& req,
+                          std::function<void(const FSReadRequest&, void*)> cb,
+                          void* cb_arg, Logger* log) {
+    ROCKS_LOG_DEBUG(log, "[sarvesh hdfs] HdfsReadableFile spawned a thread\n");
+    std::this_thread::sleep_for(std::chrono::seconds(1));
+    ROCKS_LOG_DEBUG(log, "[sarvesh hdfs] HdfsReadableFile calling callback\n");
+    cb(req, cb_arg);
+    ROCKS_LOG_DEBUG(log, "[sarvesh hdfs] HdfsReadableFile thread complete\n");
+  }
+
+  IOStatus ReadAsync(FSReadRequest& req, const IOOptions& opts,
+                     std::function<void(const FSReadRequest&, void*)> cb,
+                     void* cb_arg, void** /*io_handle*/,
+                     IOHandleDeleter* /*del_fn*/, IODebugContext* dbg) {
+    ROCKS_LOG_DEBUG(mylog,
+                    "[sarvesh hdfs] HdfsReadableFile got async request %s\n",
+                    filename_.c_str());
+    req.status =
+        Read(req.offset, req.len, opts, &(req.result), req.scratch, dbg);
+    std::thread doAsyncReadThread(doAsyncRead, std::ref(req), cb, cb_arg,
+                                  mylog);
+    ROCKS_LOG_DEBUG(mylog,
+                    "[sarvesh hdfs] HdfsReadableFile detaching thread%s\n",
+                    filename_.c_str());
+    doAsyncReadThread.detach();
+    ROCKS_LOG_DEBUG(mylog, "[sarvesh hdfs] HdfsReadableFile returning OK%s\n",
+                    filename_.c_str());
+    return IOStatus::OK();
   }
 
   // sequential access, read data at current offset in file
@@ -171,7 +201,6 @@ class HdfsReadableFile : virtual public FSSequentialFile,
   }
 
  private:
-
   // returns true if we are at the end of file, false otherwise
   bool feof() {
     ROCKS_LOG_DEBUG(mylog, "[hdfs] HdfsReadableFile feof %s\n",
@@ -199,7 +228,7 @@ class HdfsReadableFile : virtual public FSSequentialFile,
 };
 
 // Appends to an existing file in HDFS.
-class HdfsWritableFile: public FSWritableFile {
+class HdfsWritableFile : public FSWritableFile {
  private:
   hdfsFS fileSys_;
   std::string filename_;
@@ -234,14 +263,10 @@ class HdfsWritableFile: public FSWritableFile {
 
   // If the file was successfully created, then this returns true.
   // Otherwise returns false.
-  bool isValid() {
-    return hfile_ != nullptr;
-  }
+  bool isValid() { return hfile_ != nullptr; }
 
   // The name of the file, mostly needed for debug logging.
-  const std::string& getName() {
-    return filename_;
-  }
+  const std::string& getName() { return filename_; }
 
   IOStatus Append(const Slice& data, const IOOptions& /*options*/,
                   IODebugContext* /*dbg*/) override {
@@ -266,7 +291,7 @@ class HdfsWritableFile: public FSWritableFile {
     }
     return IOStatus::OK();
   }
-  
+
   IOStatus Flush(const IOOptions& /*options*/,
                  IODebugContext* /*dbg*/) override {
     return IOStatus::OK();
@@ -287,9 +312,8 @@ class HdfsWritableFile: public FSWritableFile {
     return IOStatus::OK();
   }
 
-
   IOStatus Close(const IOOptions& /*options*/,
-                  IODebugContext* /*dbg*/) override {
+                 IODebugContext* /*dbg*/) override {
     ROCKS_LOG_DEBUG(mylog, "[hdfs] HdfsWritableFile closing %s\n",
                     filename_.c_str());
     if (hdfsCloseFile(fileSys_, hfile_) != 0) {
@@ -320,8 +344,7 @@ class HdfsLogger : public Logger {
   virtual Status CloseImpl() override { return HdfsCloseHelper(); }
 
  public:
-  HdfsLogger(HdfsWritableFile* f)
-      : file_(f) {
+  HdfsLogger(HdfsWritableFile* f) : file_(f) {
     ROCKS_LOG_DEBUG(mylog, "[hdfs] HdfsLogger opened %s\n",
                     file_->getName().c_str());
   }
@@ -358,15 +381,9 @@ class HdfsLogger : public Logger {
       const time_t seconds = now_tv.tv_sec;
       struct tm t;
       localtime_r(&seconds, &t);
-      p += snprintf(p, limit - p,
-                    "%04d/%02d/%02d-%02d:%02d:%02d.%06d %llx ",
-                    t.tm_year + 1900,
-                    t.tm_mon + 1,
-                    t.tm_mday,
-                    t.tm_hour,
-                    t.tm_min,
-                    t.tm_sec,
-                    static_cast<int>(now_tv.tv_usec),
+      p += snprintf(p, limit - p, "%04d/%02d/%02d-%02d:%02d:%02d.%06d %llx ",
+                    t.tm_year + 1900, t.tm_mon + 1, t.tm_mday, t.tm_hour,
+                    t.tm_min, t.tm_sec, static_cast<int>(now_tv.tv_usec),
                     static_cast<long long unsigned int>(thread_id));
 
       // Print the message
@@ -379,8 +396,8 @@ class HdfsLogger : public Logger {
 
       // Truncate to available space if necessary
       if (p >= limit) {
-         if (iter == 0) {
-          continue;       // Try again with larger buffer
+        if (iter == 0) {
+          continue;  // Try again with larger buffer
         } else {
           p = limit - 1;
         }
@@ -418,21 +435,20 @@ class HdfsDirectory : public FSDirectory {
   int fd_;
 };
 
-  
 }  // namespace
 
 // Finally, the HdfsFileSystem
-  HdfsFileSystem::HdfsFileSystem(const std::shared_ptr<FileSystem>& base, const std::string& fsname, hdfsFS fileSys)
-  : FileSystemWrapper(base), fsname_(fsname), fileSys_(fileSys) {
-}
-  
+HdfsFileSystem::HdfsFileSystem(const std::shared_ptr<FileSystem>& base,
+                               const std::string& fsname, hdfsFS fileSys)
+    : FileSystemWrapper(base), fsname_(fsname), fileSys_(fileSys) {}
+
 HdfsFileSystem::~HdfsFileSystem() {
   if (fileSys_ != nullptr) {
     fprintf(stderr, "Destroying HdfsFileSystem(%s)\n", fsname_.c_str());
     hdfsDisconnect(fileSys_);
   }
 }
-  
+
 std::string HdfsFileSystem::GetId() const {
   if (fsname_.empty()) {
     return kProto;
@@ -443,21 +459,20 @@ std::string HdfsFileSystem::GetId() const {
     return id.append("default:0").append(fsname_);
   }
 }
-  
-Status HdfsFileSystem::ValidateOptions(const DBOptions& db_opts,
-                                       const ColumnFamilyOptions& cf_opts) const {
+
+Status HdfsFileSystem::ValidateOptions(
+    const DBOptions& db_opts, const ColumnFamilyOptions& cf_opts) const {
   if (fileSys_ != nullptr) {
     return FileSystemWrapper::ValidateOptions(db_opts, cf_opts);
   } else {
     return Status::InvalidArgument("Failed to connect to hdfs ", fsname_);
   }
 }
-  
+
 // open a file for sequential reading
-IOStatus HdfsFileSystem::NewSequentialFile(const std::string& fname,
-                                               const FileOptions& /*options*/,
-                                               std::unique_ptr<FSSequentialFile>* result,
-                                               IODebugContext* /*dbg*/) {
+IOStatus HdfsFileSystem::NewSequentialFile(
+    const std::string& fname, const FileOptions& /*options*/,
+    std::unique_ptr<FSSequentialFile>* result, IODebugContext* /*dbg*/) {
   result->reset();
   HdfsReadableFile* f = new HdfsReadableFile(fileSys_, fname);
   if (f == nullptr || !f->isValid()) {
@@ -470,10 +485,9 @@ IOStatus HdfsFileSystem::NewSequentialFile(const std::string& fname,
 }
 
 // open a file for random reading
-IOStatus HdfsFileSystem::NewRandomAccessFile(const std::string& fname,
-                                                 const FileOptions& /*options*/,
-                                                 std::unique_ptr<FSRandomAccessFile>* result,
-                                                 IODebugContext* /*dbg*/) {
+IOStatus HdfsFileSystem::NewRandomAccessFile(
+    const std::string& fname, const FileOptions& /*options*/,
+    std::unique_ptr<FSRandomAccessFile>* result, IODebugContext* /*dbg*/) {
   result->reset();
   HdfsReadableFile* f = new HdfsReadableFile(fileSys_, fname);
   if (f == nullptr || !f->isValid()) {
@@ -486,10 +500,9 @@ IOStatus HdfsFileSystem::NewRandomAccessFile(const std::string& fname,
 }
 
 // create a new file for writing
-IOStatus HdfsFileSystem::NewWritableFile(const std::string& fname,
-                                             const FileOptions& options,
-                                             std::unique_ptr<FSWritableFile>* result,
-                                             IODebugContext* /*dbg*/) {
+IOStatus HdfsFileSystem::NewWritableFile(
+    const std::string& fname, const FileOptions& options,
+    std::unique_ptr<FSWritableFile>* result, IODebugContext* /*dbg*/) {
   result->reset();
   HdfsWritableFile* f = new HdfsWritableFile(fileSys_, fname, options);
   if (f == nullptr || !f->isValid()) {
@@ -501,9 +514,9 @@ IOStatus HdfsFileSystem::NewWritableFile(const std::string& fname,
 }
 
 IOStatus HdfsFileSystem::NewDirectory(const std::string& name,
-                                          const IOOptions& options,
-                                          std::unique_ptr<FSDirectory>* result,
-                                          IODebugContext* dbg) {
+                                      const IOOptions& options,
+                                      std::unique_ptr<FSDirectory>* result,
+                                      IODebugContext* dbg) {
   IOStatus s = FileExists(name, options, dbg);
   if (s.ok()) {
     result->reset(new HdfsDirectory(0));
@@ -514,8 +527,8 @@ IOStatus HdfsFileSystem::NewDirectory(const std::string& name,
 }
 
 IOStatus HdfsFileSystem::FileExists(const std::string& fname,
-                                        const IOOptions& /*options*/,
-                                        IODebugContext* /*dbg*/) {
+                                    const IOOptions& /*options*/,
+                                    IODebugContext* /*dbg*/) {
   int value = hdfsExists(fileSys_, fname.c_str());
   switch (value) {
     case HDFS_EXISTS:
@@ -525,21 +538,22 @@ IOStatus HdfsFileSystem::FileExists(const std::string& fname,
     default:  // anything else should be an error
       ROCKS_LOG_FATAL(mylog, "FileExists hdfsExists call failed");
       return IOStatus::IOError("hdfsExists call failed with error " +
-                               std::to_string(value) + " on path " + fname + ".\n");
+                               std::to_string(value) + " on path " + fname +
+                               ".\n");
   }
 }
 
 IOStatus HdfsFileSystem::GetChildren(const std::string& path,
-                                         const IOOptions& options,
-                                         std::vector<std::string>* result, 
-                                        IODebugContext* dbg) {
+                                     const IOOptions& options,
+                                     std::vector<std::string>* result,
+                                     IODebugContext* dbg) {
   IOStatus s = FileExists(path, options, dbg);
   if (s.ok()) {
     int numEntries = 0;
     hdfsFileInfo* pHdfsFileInfo = 0;
     pHdfsFileInfo = hdfsListDirectory(fileSys_, path.c_str(), &numEntries);
     if (numEntries >= 0) {
-      for(int i = 0; i < numEntries; i++) {
+      for (int i = 0; i < numEntries; i++) {
         std::string pathname(pHdfsFileInfo[i].mName);
         size_t pos = pathname.rfind("/");
         if (std::string::npos != pos) {
@@ -559,8 +573,8 @@ IOStatus HdfsFileSystem::GetChildren(const std::string& path,
 }
 
 IOStatus HdfsFileSystem::DeleteFile(const std::string& fname,
-                                        const IOOptions& /*options*/,
-                                        IODebugContext* /*dbg*/) {
+                                    const IOOptions& /*options*/,
+                                    IODebugContext* /*dbg*/) {
   if (hdfsDelete(fileSys_, fname.c_str(), 1) == 0) {
     return IOStatus::OK();
   }
@@ -568,8 +582,8 @@ IOStatus HdfsFileSystem::DeleteFile(const std::string& fname,
 }
 
 IOStatus HdfsFileSystem::CreateDir(const std::string& name,
-                                       const IOOptions& /*options*/,
-                                       IODebugContext* /*dbg*/) {
+                                   const IOOptions& /*options*/,
+                                   IODebugContext* /*dbg*/) {
   if (hdfsCreateDirectory(fileSys_, name.c_str()) == 0) {
     return IOStatus::OK();
   }
@@ -577,26 +591,25 @@ IOStatus HdfsFileSystem::CreateDir(const std::string& name,
 }
 
 IOStatus HdfsFileSystem::CreateDirIfMissing(const std::string& name,
-                                                const IOOptions& options,
-                                                IODebugContext* dbg) {
+                                            const IOOptions& options,
+                                            IODebugContext* dbg) {
   IOStatus s = FileExists(name, options, dbg);
   if (s.IsNotFound()) {
-  //  Not atomic. state might change b/w hdfsExists and CreateDir.
+    //  Not atomic. state might change b/w hdfsExists and CreateDir.
     s = CreateDir(name, options, dbg);
   }
   return s;
 }
-  
-IOStatus HdfsFileSystem::DeleteDir(const std::string& name, 
-                                       const IOOptions& options,
-                                       IODebugContext* dbg) {
+
+IOStatus HdfsFileSystem::DeleteDir(const std::string& name,
+                                   const IOOptions& options,
+                                   IODebugContext* dbg) {
   return DeleteFile(name, options, dbg);
 };
 
 IOStatus HdfsFileSystem::GetFileSize(const std::string& fname,
-                                         const IOOptions& /*options*/,
-                                         uint64_t* size,
-                                         IODebugContext* /*dbg*/) {
+                                     const IOOptions& /*options*/,
+                                     uint64_t* size, IODebugContext* /*dbg*/) {
   *size = 0L;
   hdfsFileInfo* pFileInfo = hdfsGetPathInfo(fileSys_, fname.c_str());
   if (pFileInfo != nullptr) {
@@ -607,10 +620,10 @@ IOStatus HdfsFileSystem::GetFileSize(const std::string& fname,
   return IOError(fname, errno);
 }
 
-IOStatus HdfsFileSystem::GetFileModificationTime(const std::string& fname, 
-                                                     const IOOptions& /*options*/,
-                                                     uint64_t* time, 
-                                                     IODebugContext* /*dbg*/) {
+IOStatus HdfsFileSystem::GetFileModificationTime(const std::string& fname,
+                                                 const IOOptions& /*options*/,
+                                                 uint64_t* time,
+                                                 IODebugContext* /*dbg*/) {
   hdfsFileInfo* pFileInfo = hdfsGetPathInfo(fileSys_, fname.c_str());
   if (pFileInfo != nullptr) {
     *time = static_cast<uint64_t>(pFileInfo->mLastMod);
@@ -618,14 +631,15 @@ IOStatus HdfsFileSystem::GetFileModificationTime(const std::string& fname,
     return IOStatus::OK();
   }
   return IOError(fname, errno);
-
 }
 
 // The rename is not atomic. HDFS does not allow a renaming if the
 // target already exists. So, we delete the target before attempting the
 // rename.
-IOStatus HdfsFileSystem::RenameFile(const std::string& src, const std::string& target,
-                                        const IOOptions& /*options*/, IODebugContext* /*dbg*/) {
+IOStatus HdfsFileSystem::RenameFile(const std::string& src,
+                                    const std::string& target,
+                                    const IOOptions& /*options*/,
+                                    IODebugContext* /*dbg*/) {
   hdfsDelete(fileSys_, target.c_str(), 1);
   if (hdfsRename(fileSys_, src.c_str(), target.c_str()) == 0) {
     return IOStatus::OK();
@@ -634,9 +648,8 @@ IOStatus HdfsFileSystem::RenameFile(const std::string& src, const std::string& t
 }
 
 IOStatus HdfsFileSystem::LockFile(const std::string& /*fname*/,
-                                      const IOOptions& /*options*/,
-                                      FileLock** lock,
-                                      IODebugContext* /*dbg*/) {
+                                  const IOOptions& /*options*/, FileLock** lock,
+                                  IODebugContext* /*dbg*/) {
   // there isn's a very good way to atomically check and create
   // a file via libhdfs
   *lock = nullptr;
@@ -644,15 +657,15 @@ IOStatus HdfsFileSystem::LockFile(const std::string& /*fname*/,
 }
 
 IOStatus HdfsFileSystem::UnlockFile(FileLock* /*lock*/,
-                                        const IOOptions& /*options*/,
-                                        IODebugContext* /*dbg*/) {
+                                    const IOOptions& /*options*/,
+                                    IODebugContext* /*dbg*/) {
   return IOStatus::OK();
 }
 
 IOStatus HdfsFileSystem::NewLogger(const std::string& fname,
-                                       const IOOptions& /*options*/,
-                                       std::shared_ptr<Logger>* result,
-                                       IODebugContext* /*dbg*/) {
+                                   const IOOptions& /*options*/,
+                                   std::shared_ptr<Logger>* result,
+                                   IODebugContext* /*dbg*/) {
   // EnvOptions is used exclusively for its `strict_bytes_per_sync` value. That
   // option is only intended for WAL/flush/compaction writes, so turn it off in
   // the logger.
@@ -673,10 +686,8 @@ IOStatus HdfsFileSystem::NewLogger(const std::string& fname,
 }
 
 IOStatus HdfsFileSystem::IsDirectory(const std::string& path,
-                                         const IOOptions& /*options*/, 
-                                         bool* is_dir,
-                                         IODebugContext* /*dbg*/) {
-                                         
+                                     const IOOptions& /*options*/, bool* is_dir,
+                                     IODebugContext* /*dbg*/) {
   hdfsFileInfo* pFileInfo = hdfsGetPathInfo(fileSys_, path.c_str());
   if (pFileInfo != nullptr) {
     if (is_dir != nullptr) {
@@ -688,7 +699,9 @@ IOStatus HdfsFileSystem::IsDirectory(const std::string& path,
   return IOError(path, errno);
 }
 
-Status HdfsFileSystem::Create(const std::shared_ptr<FileSystem>& base, const std::string& uri, std::unique_ptr<FileSystem>* result) {
+Status HdfsFileSystem::Create(const std::shared_ptr<FileSystem>& base,
+                              const std::string& uri,
+                              std::unique_ptr<FileSystem>* result) {
   result->reset();
   std::string cwd;
   hdfsFS fs;
@@ -706,18 +719,18 @@ Status HdfsFileSystem::Create(const std::shared_ptr<FileSystem>& base, const std
       return Status::InvalidArgument("Bad host-port for hdfs ", uri);
     } else {
       std::string host = uri.substr(start, colon);
-      std::string rest = uri.substr(colon+1);
+      std::string rest = uri.substr(colon + 1);
       auto slash = rest.find('/');
       if (slash != std::string::npos) {
         cwd = rest.substr(slash);
         rest = rest.substr(0, slash);
       }
-      char *end = nullptr;
+      char* end = nullptr;
       auto port = strtol(rest.c_str(), &end, 10);
       if (static_cast<size_t>(end - rest.data()) != rest.length()) {
-        return Status::InvalidArgument("Bad host-port for hdfs ",  uri);
+        return Status::InvalidArgument("Bad host-port for hdfs ", uri);
       } else if (port == 0) {
-        return Status::InvalidArgument("Bad host-port0 for hdfs ",  uri);
+        return Status::InvalidArgument("Bad host-port0 for hdfs ", uri);
       } else {
         fs = hdfsConnectNewInstance(host.c_str(), static_cast<tPort>(port));
       }
@@ -736,4 +749,3 @@ Status HdfsFileSystem::Create(const std::shared_ptr<FileSystem>& base, const std
   return Status::OK();
 }
 }  // namespace ROCKSDB_NAMESPACE
-
